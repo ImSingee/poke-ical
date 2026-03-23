@@ -1,0 +1,9 @@
+name = "ical-poke-bridge"
+main = "src/worker.ts"
+compatibility_date = "2025-01-01"
+
+[vars]
+POKECALENDARID = "your-calendar-id-here"
+
+# Store POKEAPIKEY as a secret:
+#   npx wrangler secret put POKEAPIKEY

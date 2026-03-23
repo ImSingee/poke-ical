@@ -1,4 +1,4 @@
-name = "ical-poke-bridge"
+name = "poke-ical"
 main = "src/worker.ts"
 compatibility_date = "2025-01-01"
 

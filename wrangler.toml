@@ -2,8 +2,6 @@ name = "poke-ical"
 main = "src/worker.ts"
 compatibility_date = "2025-01-01"
 
-[vars]
-POKECALENDARID = "your-calendar-id-here"
-
-# Store POKEAPIKEY as a secret:
-#   npx wrangler secret put POKEAPIKEY
+# Required secrets (set via `npx wrangler secret put`):
+#   CALDAV_USERNAME  — Apple ID email
+#   CALDAV_PASSWORD  — App-specific password from appleid.apple.com

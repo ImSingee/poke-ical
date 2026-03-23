@@ -4,16 +4,19 @@
  * Exposes 9 CalDAV tools via the Model Context Protocol over SSE.
  * Endpoint: /mcp
  *
- * Required env vars / secrets:
- *   CALDAV_USERNAME  — Apple ID email
+ * Required Worker secrets:
+ *   CALDAV_USERNAME  — Apple ID email (e.g. user@icloud.com)
  *   CALDAV_PASSWORD  — App-specific password from appleid.apple.com
- *   CALDAV_HOME_URL  — (optional) CalDAV principal URL; defaults to iCloud
+ *
+ * iCloud CalDAV discovery is a 2-step process:
+ *   1. PROPFIND https://caldav.icloud.com/ → current-user-principal href
+ *   2. PROPFIND {principal} → calendar-home-set href
+ *   3. PROPFIND {home-set} → enumerate individual calendars
  */
 
 export interface Env {
   CALDAV_USERNAME: string;
   CALDAV_PASSWORD: string;
-  CALDAV_HOME_URL?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -35,19 +38,20 @@ interface JsonRpcResponse {
 }
 
 // ---------------------------------------------------------------------------
-// CalDAV helpers
+// CalDAV constants & low-level helpers
 // ---------------------------------------------------------------------------
 
-const ICLOUD_CALDAV = 'https://caldav.icloud.com';
+const ICLOUD_CALDAV_ROOT = 'https://caldav.icloud.com';
 
 function basicAuth(env: Env): string {
   return 'Basic ' + btoa(`${env.CALDAV_USERNAME}:${env.CALDAV_PASSWORD}`);
 }
 
-function homeUrl(env: Env): string {
-  return env.CALDAV_HOME_URL ?? `${ICLOUD_CALDAV}/`;
-}
-
+/**
+ * Perform a raw CalDAV / WebDAV request.
+ * Throws (and logs) on network-level errors; returns status + body text for
+ * HTTP-level errors so callers can decide how to handle them.
+ */
 async function caldavRequest(
   env: Env,
   url: string,
@@ -60,67 +64,176 @@ async function caldavRequest(
     'Content-Type': 'application/xml; charset=utf-8',
     ...extraHeaders,
   };
-  const res = await fetch(url, { method, headers, body });
+  let res: Response;
+  try {
+    res = await fetch(url, { method, headers, body });
+  } catch (err) {
+    console.error(`[poke-ical] fetch failed — ${method} ${url}:`, err);
+    throw err;
+  }
   const text = await res.text();
+  if (res.status >= 400) {
+    console.error(
+      `[poke-ical] HTTP error — ${method} ${url} → ${res.status}\n`,
+      text.slice(0, 500),
+    );
+  }
   return { status: res.status, text };
 }
 
-// Minimal XML value extractor (no full parser needed for CalDAV)
-function xmlValues(xml: string, tag: string): string[] {
-  const results: string[] = [];
-  const re = new RegExp(`<[^>]*:?${tag}[^>]*>([\\s\\S]*?)<\/[^>]*:?${tag}>`, 'gi');
+// ---------------------------------------------------------------------------
+// XML helpers  (no dependency on a full XML parser)
+// ---------------------------------------------------------------------------
+
+/** Return ALL text contents of every element matching `localName` (namespace-agnostic). */
+function xmlAll(xml: string, localName: string): string[] {
+  const out: string[] = [];
+  // matches both <D:foo> … </D:foo>  and  <foo> … </foo>
+  const re = new RegExp(
+    `<(?:[^:>]+:)?${localName}(?:\\s[^>]*)?>([\\s\\S]*?)<\/(?:[^:>]+:)?${localName}>`,
+    'gi',
+  );
   let m: RegExpExecArray | null;
-  while ((m = re.exec(xml)) !== null) results.push(m[1].trim());
-  return results;
+  while ((m = re.exec(xml)) !== null) out.push(m[1].trim());
+  return out;
 }
 
-function xmlAttr(tag: string, xml: string, attr: string): string {
-  const re = new RegExp(`<[^>]*:?${tag}[^>]*${attr}="([^"]*)"`,'i');
-  const m = re.exec(xml);
-  return m ? m[1] : '';
+/** Return the text content of the FIRST matching element. */
+function xmlFirst(xml: string, localName: string): string {
+  return xmlAll(xml, localName)[0] ?? '';
 }
 
 // ---------------------------------------------------------------------------
-// Discover calendars via PROPFIND
+// Step 1 – resolve current-user-principal
+// ---------------------------------------------------------------------------
+async function fetchPrincipalUrl(env: Env): Promise<string> {
+  const body = `<?xml version="1.0" encoding="utf-8"?>
+<D:propfind xmlns:D="DAV:">
+  <D:prop>
+    <D:current-user-principal/>
+  </D:prop>
+</D:propfind>`;
+
+  const { status, text } = await caldavRequest(
+    env,
+    `${ICLOUD_CALDAV_ROOT}/`,
+    'PROPFIND',
+    body,
+    { Depth: '0' },
+  );
+
+  if (status >= 400) {
+    throw new Error(
+      `PROPFIND for current-user-principal returned ${status}. ` +
+      'Check CALDAV_USERNAME and CALDAV_PASSWORD.',
+    );
+  }
+
+  // <D:current-user-principal><D:href>/123456789/principal/</D:href>…
+  const href = xmlFirst(xmlFirst(text, 'current-user-principal'), 'href');
+  if (!href) {
+    console.error('[poke-ical] current-user-principal href not found in:\n', text.slice(0, 800));
+    throw new Error('Could not find current-user-principal href in PROPFIND response.');
+  }
+  const principalUrl = href.startsWith('http') ? href : `${ICLOUD_CALDAV_ROOT}${href}`;
+  console.log('[poke-ical] principal URL:', principalUrl);
+  return principalUrl;
+}
+
+// ---------------------------------------------------------------------------
+// Step 2 – resolve calendar-home-set from principal URL
+// ---------------------------------------------------------------------------
+async function fetchCalendarHomeSet(env: Env, principalUrl: string): Promise<string> {
+  const body = `<?xml version="1.0" encoding="utf-8"?>
+<D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:prop>
+    <C:calendar-home-set/>
+  </D:prop>
+</D:propfind>`;
+
+  const { status, text } = await caldavRequest(
+    env,
+    principalUrl,
+    'PROPFIND',
+    body,
+    { Depth: '0' },
+  );
+
+  if (status >= 400) {
+    throw new Error(`PROPFIND for calendar-home-set returned ${status}.`);
+  }
+
+  const href = xmlFirst(xmlFirst(text, 'calendar-home-set'), 'href');
+  if (!href) {
+    console.error('[poke-ical] calendar-home-set href not found in:\n', text.slice(0, 800));
+    throw new Error('Could not find calendar-home-set href in PROPFIND response.');
+  }
+  const homeSetUrl = href.startsWith('http') ? href : `${ICLOUD_CALDAV_ROOT}${href}`;
+  console.log('[poke-ical] calendar-home-set URL:', homeSetUrl);
+  return homeSetUrl;
+}
+
+// ---------------------------------------------------------------------------
+// Full 2-step iCloud discovery → calendar-home-set URL
+// ---------------------------------------------------------------------------
+async function resolveHomeSet(env: Env): Promise<string> {
+  const principalUrl = await fetchPrincipalUrl(env);
+  return fetchCalendarHomeSet(env, principalUrl);
+}
+
+// ---------------------------------------------------------------------------
+// Step 3 – list calendars under the home-set URL
 // ---------------------------------------------------------------------------
 async function discoverCalendars(
   env: Env,
 ): Promise<Array<{ url: string; displayName: string; ctag: string }>> {
+  const homeSetUrl = await resolveHomeSet(env);
+
   const body = `<?xml version="1.0" encoding="utf-8"?>
-<D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+<D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"
+            xmlns:CS="http://calendarserver.org/ns/">
   <D:prop>
     <D:displayname/>
     <D:resourcetype/>
-    <CS:getctag xmlns:CS="http://calendarserver.org/ns/"/>
+    <CS:getctag/>
   </D:prop>
 </D:propfind>`;
 
-  const { text } = await caldavRequest(env, homeUrl(env), 'PROPFIND', body, { Depth: '1' });
+  const { status, text } = await caldavRequest(env, homeSetUrl, 'PROPFIND', body, { Depth: '1' });
+  if (status >= 400) {
+    throw new Error(`PROPFIND for calendars at ${homeSetUrl} returned ${status}.`);
+  }
 
-  // Extract calendar entries from multistatus
-  const responses = text.split(/<D:response|<response/i).slice(1);
+  // Split into per-response blocks
+  const responseBlocks = text.split(/<(?:[^:>]+:)?response(?:\s[^>]*)?>/).slice(1);
   const calendars: Array<{ url: string; displayName: string; ctag: string }> = [];
 
-  for (const resp of responses) {
-    // Only include actual calendar collections
-    if (!resp.includes('calendar') && !resp.includes('Calendar')) continue;
-    const hrefMatch = /<D:href>([^<]+)<\/D:href>/i.exec(resp) ??
-                      /<href>([^<]+)<\/href>/i.exec(resp);
-    if (!hrefMatch) continue;
-    const href = hrefMatch[1].trim();
-    const nameMatch = /<D:displayname>([^<]*)<\/D:displayname>/i.exec(resp) ??
-                      /<displayname>([^<]*)<\/displayname>/i.exec(resp);
-    const displayName = nameMatch ? nameMatch[1].trim() : href;
-    const ctagMatch = /<[^>]*:?getctag[^>]*>([^<]*)<\/[^>]*:?getctag>/i.exec(resp);
-    const ctag = ctagMatch ? ctagMatch[1].trim() : '';
-    const url = href.startsWith('http') ? href : `${ICLOUD_CALDAV}${href}`;
+  for (const block of responseBlocks) {
+    // Must be a calendar collection (resourcetype contains 'calendar')
+    if (!/calendar/i.test(block)) continue;
+    // But skip the home-set container itself (which is only a collection, not a calendar)
+    if (/principal/i.test(block)) continue;
+
+    const rawHref = xmlFirst(block, 'href');
+    if (!rawHref) continue;
+
+    const url = rawHref.startsWith('http')
+      ? rawHref
+      : `${ICLOUD_CALDAV_ROOT}${rawHref}`;
+
+    const displayName = xmlFirst(block, 'displayname') || rawHref;
+    const ctag = xmlFirst(block, 'getctag');
+
     calendars.push({ url, displayName, ctag });
   }
+
+  console.log(`[poke-ical] discovered ${calendars.length} calendar(s):`,
+    calendars.map((c) => c.displayName));
   return calendars;
 }
 
 // ---------------------------------------------------------------------------
-// Fetch events from a calendar URL via REPORT
+// Fetch events via calendar-query REPORT
 // ---------------------------------------------------------------------------
 async function fetchEvents(
   env: Env,
@@ -132,8 +245,7 @@ async function fetchEvents(
   if (start || end) {
     const s = start ?? '19700101T000000Z';
     const e = end ?? '20991231T235959Z';
-    timeFilter = `
-      <C:time-range start="${s}" end="${e}"/>`;
+    timeFilter = `\n      <C:time-range start="${s}" end="${e}"/>`;
   }
 
   const body = `<?xml version="1.0" encoding="utf-8"?>
@@ -150,23 +262,24 @@ async function fetchEvents(
   </C:filter>
 </C:calendar-query>`;
 
-  const { text } = await caldavRequest(env, calendarUrl, 'REPORT', body, {
+  const { status, text } = await caldavRequest(env, calendarUrl, 'REPORT', body, {
     Depth: '1',
-    'Content-Type': 'application/xml; charset=utf-8',
   });
+  if (status >= 400) {
+    throw new Error(`REPORT on ${calendarUrl} returned ${status}.`);
+  }
 
   return parseEvents(text);
 }
 
 // ---------------------------------------------------------------------------
-// Parse VCALENDAR response into event objects
+// Parse multi-status REPORT response into event objects
 // ---------------------------------------------------------------------------
 function parseEvents(xml: string): Array<Record<string, string>> {
   const events: Array<Record<string, string>> = [];
-  // Extract each calendar-data block
-  const dataBlocks = xmlValues(xml, 'calendar-data');
-  const etagBlocks = xmlValues(xml, 'getetag');
-  const hrefBlocks = xmlValues(xml, 'href');
+  const dataBlocks = xmlAll(xml, 'calendar-data');
+  const etagBlocks = xmlAll(xml, 'getetag');
+  const hrefBlocks = xmlAll(xml, 'href');
 
   for (let i = 0; i < dataBlocks.length; i++) {
     const ical = dataBlocks[i];
@@ -174,7 +287,6 @@ function parseEvents(xml: string): Array<Record<string, string>> {
     event.etag = etagBlocks[i] ?? '';
     event.href = hrefBlocks[i] ?? '';
 
-    // Parse VEVENT properties
     const veventMatch = /BEGIN:VEVENT([\s\S]*?)END:VEVENT/i.exec(ical);
     if (!veventMatch) continue;
     const vevent = veventMatch[1];
@@ -192,7 +304,7 @@ function parseEvents(xml: string): Array<Record<string, string>> {
 }
 
 // ---------------------------------------------------------------------------
-// Create a VEVENT iCalendar string
+// Build a minimal VCALENDAR / VEVENT string for PUT requests
 // ---------------------------------------------------------------------------
 function makeVEvent(params: {
   uid: string;
@@ -203,13 +315,14 @@ function makeVEvent(params: {
   location?: string;
   allDay?: boolean;
 }): string {
+  const stamp = new Date().toISOString().replace(/[-:.]/g, '').substring(0, 15) + 'Z';
   const lines = [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
     'PRODID:-//poke-ical//EN',
     'BEGIN:VEVENT',
     `UID:${params.uid}`,
-    `DTSTAMP:${new Date().toISOString().replace(/[-:.]/g, '').substring(0, 15)}Z`,
+    `DTSTAMP:${stamp}`,
     `SUMMARY:${params.summary}`,
     params.allDay
       ? `DTSTART;VALUE=DATE:${params.dtstart}`
@@ -225,18 +338,16 @@ function makeVEvent(params: {
 }
 
 // ---------------------------------------------------------------------------
-// Tool definitions
+// MCP tool definitions
 // ---------------------------------------------------------------------------
 
 const TOOLS = [
   {
     name: 'list_calendars',
-    description: 'List all iCloud calendars available on the account.',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-      required: [],
-    },
+    description:
+      'List all iCloud calendars on the account. Performs the required 2-step ' +
+      'iCloud discovery (principal → calendar-home-set) automatically.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
   },
   {
     name: 'list_events',
@@ -244,20 +355,32 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        calendar_url: { type: 'string', description: 'CalDAV URL of the calendar (from list_calendars).' },
-        start: { type: 'string', description: 'Start datetime in iCalendar format (e.g. 20260101T000000Z).' },
-        end: { type: 'string', description: 'End datetime in iCalendar format (e.g. 20261231T235959Z).' },
+        calendar_url: {
+          type: 'string',
+          description: 'CalDAV URL of the calendar (from list_calendars).',
+        },
+        start: {
+          type: 'string',
+          description: 'Start in iCalendar basic format, e.g. 20260101T000000Z.',
+        },
+        end: {
+          type: 'string',
+          description: 'End in iCalendar basic format, e.g. 20261231T235959Z.',
+        },
       },
       required: ['calendar_url'],
     },
   },
   {
     name: 'get_event',
-    description: 'Fetch the raw iCalendar data for a specific event by its URL.',
+    description: 'Fetch the raw iCalendar (.ics) data for a specific event by URL.',
     inputSchema: {
       type: 'object',
       properties: {
-        event_url: { type: 'string', description: 'Full CalDAV URL of the event .ics resource.' },
+        event_url: {
+          type: 'string',
+          description: 'Full CalDAV URL of the .ics resource.',
+        },
       },
       required: ['event_url'],
     },
@@ -270,24 +393,27 @@ const TOOLS = [
       properties: {
         calendar_url: { type: 'string', description: 'CalDAV URL of the target calendar.' },
         summary: { type: 'string', description: 'Event title.' },
-        dtstart: { type: 'string', description: 'Start in iCalendar format (e.g. 20260315T140000Z).' },
-        dtend: { type: 'string', description: 'End in iCalendar format (e.g. 20260315T150000Z).' },
-        description: { type: 'string', description: 'Optional event description.' },
+        dtstart: { type: 'string', description: 'Start, e.g. 20260315T140000Z.' },
+        dtend: { type: 'string', description: 'End, e.g. 20260315T150000Z.' },
+        description: { type: 'string', description: 'Optional description.' },
         location: { type: 'string', description: 'Optional location.' },
-        all_day: { type: 'boolean', description: 'Set true for all-day events (use DATE format for dtstart/dtend).' },
+        all_day: {
+          type: 'boolean',
+          description: 'True for all-day events; use DATE format (YYYYMMDD) for dtstart/dtend.',
+        },
       },
       required: ['calendar_url', 'summary', 'dtstart', 'dtend'],
     },
   },
   {
     name: 'update_event',
-    description: 'Update an existing event. Fetches the event, applies changes, and saves it back.',
+    description: 'Update fields on an existing event (fetches, patches, saves back).',
     inputSchema: {
       type: 'object',
       properties: {
         event_url: { type: 'string', description: 'Full CalDAV URL of the .ics event.' },
-        etag: { type: 'string', description: 'Current ETag of the event (for conflict detection). Optional.' },
-        summary: { type: 'string', description: 'New title (leave out to keep existing).' },
+        etag: { type: 'string', description: 'Current ETag for conflict detection (optional).' },
+        summary: { type: 'string', description: 'New title.' },
         dtstart: { type: 'string', description: 'New start datetime.' },
         dtend: { type: 'string', description: 'New end datetime.' },
         description: { type: 'string', description: 'New description.' },
@@ -298,11 +424,11 @@ const TOOLS = [
   },
   {
     name: 'delete_event',
-    description: 'Delete an event from a calendar.',
+    description: 'Delete an event by its CalDAV URL.',
     inputSchema: {
       type: 'object',
       properties: {
-        event_url: { type: 'string', description: 'Full CalDAV URL of the .ics event to delete.' },
+        event_url: { type: 'string', description: 'Full CalDAV URL of the .ics event.' },
         etag: { type: 'string', description: 'ETag for safe deletion (optional).' },
       },
       required: ['event_url'],
@@ -310,12 +436,13 @@ const TOOLS = [
   },
   {
     name: 'search_events',
-    description: 'Search for events by keyword in summary, description, or location across a calendar.',
+    description:
+      'Search events by keyword (case-insensitive) across summary, description, and location.',
     inputSchema: {
       type: 'object',
       properties: {
         calendar_url: { type: 'string', description: 'CalDAV URL of the calendar to search.' },
-        query: { type: 'string', description: 'Keyword to search for (case-insensitive).' },
+        query: { type: 'string', description: 'Keyword to match.' },
         start: { type: 'string', description: 'Optional start bound (iCal format).' },
         end: { type: 'string', description: 'Optional end bound (iCal format).' },
       },
@@ -324,7 +451,7 @@ const TOOLS = [
   },
   {
     name: 'get_freebusy',
-    description: 'Return free/busy information (list of busy intervals) for a calendar within a date range.',
+    description: 'Return a list of busy intervals (start/end/summary) within a date range.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -337,7 +464,7 @@ const TOOLS = [
   },
   {
     name: 'get_ical_feed',
-    description: 'Return all events as a complete iCalendar (.ics) feed string for a given calendar.',
+    description: 'Return all events as a complete iCalendar (.ics) feed string.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -360,30 +487,31 @@ async function executeTool(
   switch (name) {
     // ---- list_calendars ---------------------------------------------------
     case 'list_calendars': {
-      const cals = await discoverCalendars(env);
-      return { calendars: cals };
+      const calendars = await discoverCalendars(env);
+      return { calendars };
     }
 
     // ---- list_events ------------------------------------------------------
     case 'list_events': {
-      const url = args.calendar_url as string;
-      const start = args.start as string | undefined;
-      const end = args.end as string | undefined;
-      const events = await fetchEvents(env, url, start, end);
+      const events = await fetchEvents(
+        env,
+        args.calendar_url as string,
+        args.start as string | undefined,
+        args.end as string | undefined,
+      );
       return { events };
     }
 
     // ---- get_event --------------------------------------------------------
     case 'get_event': {
-      const url = args.event_url as string;
-      const { status, text } = await caldavRequest(env, url, 'GET');
-      if (status >= 400) throw new Error(`GET ${url} returned ${status}`);
+      const { status, text } = await caldavRequest(env, args.event_url as string, 'GET');
+      if (status >= 400) throw new Error(`GET event returned ${status}`);
       return { ical: text };
     }
 
     // ---- create_event -----------------------------------------------------
     case 'create_event': {
-      const calUrl = args.calendar_url as string;
+      const calUrl = (args.calendar_url as string).replace(/\/?$/, '/');
       const uid = crypto.randomUUID();
       const ical = makeVEvent({
         uid,
@@ -394,48 +522,53 @@ async function executeTool(
         location: args.location as string | undefined,
         allDay: args.all_day as boolean | undefined,
       });
-      const eventUrl = calUrl.replace(/\/?$/, '/') + uid + '.ics';
+      const eventUrl = `${calUrl}${uid}.ics`;
       const { status } = await caldavRequest(env, eventUrl, 'PUT', ical, {
         'Content-Type': 'text/calendar; charset=utf-8',
         'If-None-Match': '*',
       });
-      if (status >= 400) throw new Error(`PUT event returned ${status}`);
+      if (status >= 400) throw new Error(`PUT new event returned ${status}`);
       return { uid, event_url: eventUrl, status };
     }
 
     // ---- update_event -----------------------------------------------------
     case 'update_event': {
       const eventUrl = args.event_url as string;
-      // Fetch current event
-      const { status: getStatus, text: existing } = await caldavRequest(env, eventUrl, 'GET');
-      if (getStatus >= 400) throw new Error(`GET event returned ${getStatus}`);
+      const { status: gs, text: existing } = await caldavRequest(env, eventUrl, 'GET');
+      if (gs >= 400) throw new Error(`GET event for update returned ${gs}`);
 
-      // Build updated ical by patching the existing one
       let updated = existing;
-      if (args.summary) updated = updated.replace(/SUMMARY:.*/i, `SUMMARY:${args.summary}`);
-      if (args.dtstart) updated = updated.replace(/DTSTART[^:]*:.*/i, `DTSTART:${args.dtstart}`);
-      if (args.dtend) updated = updated.replace(/DTEND[^:]*:.*/i, `DTEND:${args.dtend}`);
+      if (args.summary)
+        updated = updated.replace(/SUMMARY:.*/i, `SUMMARY:${args.summary}`);
+      if (args.dtstart)
+        updated = updated.replace(/DTSTART[^:\r\n]*:.*/i, `DTSTART:${args.dtstart}`);
+      if (args.dtend)
+        updated = updated.replace(/DTEND[^:\r\n]*:.*/i, `DTEND:${args.dtend}`);
       if (args.description) {
-        if (/DESCRIPTION:/i.test(updated)) {
+        if (/DESCRIPTION:/i.test(updated))
           updated = updated.replace(/DESCRIPTION:.*/i, `DESCRIPTION:${args.description}`);
-        } else {
-          updated = updated.replace(/END:VEVENT/i, `DESCRIPTION:${args.description}\r\nEND:VEVENT`);
-        }
+        else
+          updated = updated.replace(
+            /END:VEVENT/i,
+            `DESCRIPTION:${args.description}\r\nEND:VEVENT`,
+          );
       }
       if (args.location) {
-        if (/LOCATION:/i.test(updated)) {
+        if (/LOCATION:/i.test(updated))
           updated = updated.replace(/LOCATION:.*/i, `LOCATION:${args.location}`);
-        } else {
-          updated = updated.replace(/END:VEVENT/i, `LOCATION:${args.location}\r\nEND:VEVENT`);
-        }
+        else
+          updated = updated.replace(
+            /END:VEVENT/i,
+            `LOCATION:${args.location}\r\nEND:VEVENT`,
+          );
       }
 
-      const ifMatchHeaders: Record<string, string> = {
+      const putHeaders: Record<string, string> = {
         'Content-Type': 'text/calendar; charset=utf-8',
       };
-      if (args.etag) ifMatchHeaders['If-Match'] = args.etag as string;
+      if (args.etag) putHeaders['If-Match'] = args.etag as string;
 
-      const { status } = await caldavRequest(env, eventUrl, 'PUT', updated, ifMatchHeaders);
+      const { status } = await caldavRequest(env, eventUrl, 'PUT', updated, putHeaders);
       if (status >= 400) throw new Error(`PUT update returned ${status}`);
       return { event_url: eventUrl, status };
     }
@@ -446,40 +579,48 @@ async function executeTool(
       const headers: Record<string, string> = {};
       if (args.etag) headers['If-Match'] = args.etag as string;
       const { status } = await caldavRequest(env, eventUrl, 'DELETE', undefined, headers);
-      if (status >= 400 && status !== 404) throw new Error(`DELETE returned ${status}`);
+      if (status >= 400 && status !== 404)
+        throw new Error(`DELETE returned ${status}`);
       return { deleted: true, status };
     }
 
     // ---- search_events ----------------------------------------------------
     case 'search_events': {
-      const calUrl = args.calendar_url as string;
-      const query = (args.query as string).toLowerCase();
-      const start = args.start as string | undefined;
-      const end = args.end as string | undefined;
-      const events = await fetchEvents(env, calUrl, start, end);
+      const q = (args.query as string).toLowerCase();
+      const events = await fetchEvents(
+        env,
+        args.calendar_url as string,
+        args.start as string | undefined,
+        args.end as string | undefined,
+      );
       const matched = events.filter(
         (e) =>
-          (e['SUMMARY'] ?? '').toLowerCase().includes(query) ||
-          (e['DESCRIPTION'] ?? '').toLowerCase().includes(query) ||
-          (e['LOCATION'] ?? '').toLowerCase().includes(query),
+          (e['SUMMARY'] ?? '').toLowerCase().includes(q) ||
+          (e['DESCRIPTION'] ?? '').toLowerCase().includes(q) ||
+          (e['LOCATION'] ?? '').toLowerCase().includes(q),
       );
       return { events: matched };
     }
 
     // ---- get_freebusy -----------------------------------------------------
     case 'get_freebusy': {
-      const calUrl = args.calendar_url as string;
-      const start = args.start as string;
-      const end = args.end as string;
-      const events = await fetchEvents(env, calUrl, start, end);
-      const busy = events.map((e) => ({ start: e['DTSTART'], end: e['DTEND'], summary: e['SUMMARY'] }));
-      return { start, end, busy };
+      const events = await fetchEvents(
+        env,
+        args.calendar_url as string,
+        args.start as string,
+        args.end as string,
+      );
+      const busy = events.map((e) => ({
+        start: e['DTSTART'],
+        end: e['DTEND'],
+        summary: e['SUMMARY'],
+      }));
+      return { start: args.start, end: args.end, busy };
     }
 
     // ---- get_ical_feed ----------------------------------------------------
     case 'get_ical_feed': {
-      const calUrl = args.calendar_url as string;
-      const events = await fetchEvents(env, calUrl);
+      const events = await fetchEvents(env, args.calendar_url as string);
       const lines = [
         'BEGIN:VCALENDAR',
         'VERSION:2.0',
@@ -490,7 +631,7 @@ async function executeTool(
       for (const e of events) {
         lines.push('BEGIN:VEVENT');
         for (const [k, v] of Object.entries(e)) {
-          if (!['etag', 'href'].includes(k)) lines.push(`${k}:${v}`);
+          if (k !== 'etag' && k !== 'href') lines.push(`${k}:${v}`);
         }
         lines.push('END:VEVENT');
       }
@@ -507,29 +648,25 @@ async function executeTool(
 // JSON-RPC dispatcher
 // ---------------------------------------------------------------------------
 
-async function handleJsonRpc(
-  req: JsonRpcRequest,
-  env: Env,
-): Promise<JsonRpcResponse> {
+async function handleJsonRpc(req: JsonRpcRequest, env: Env): Promise<JsonRpcResponse | null> {
   const { method, params, id } = req;
 
   try {
-    // MCP lifecycle
     if (method === 'initialize') {
       return {
         jsonrpc: '2.0',
         id,
         result: {
           protocolVersion: '2024-11-05',
-          serverInfo: { name: 'poke-ical', version: '1.0.0' },
+          serverInfo: { name: 'poke-ical', version: '2.0.0' },
           capabilities: { tools: {} },
         },
       };
     }
 
-    if (method === 'notifications/initialized') {
-      // notification — no response needed but we send empty
-      return { jsonrpc: '2.0', id: null, result: null };
+    // Notifications have no response
+    if (method === 'notifications/initialized' || method === 'initialized') {
+      return null;
     }
 
     if (method === 'tools/list') {
@@ -548,6 +685,10 @@ async function handleJsonRpc(
       };
     }
 
+    if (method === 'ping') {
+      return { jsonrpc: '2.0', id, result: {} };
+    }
+
     return {
       jsonrpc: '2.0',
       id,
@@ -555,11 +696,8 @@ async function handleJsonRpc(
     };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    return {
-      jsonrpc: '2.0',
-      id,
-      error: { code: -32000, message },
-    };
+    console.error(`[poke-ical] tool error (${method}):`, err);
+    return { jsonrpc: '2.0', id, error: { code: -32000, message } };
   }
 }
 
@@ -579,31 +717,80 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // ------------------------------------------------------------------
-    // /mcp — MCP over SSE
-    // GET  → opens the SSE stream and sends endpoint event
-    // POST → accepts JSON-RPC messages, responds via SSE
-    // ------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // /mcp  — MCP over SSE
+    // -----------------------------------------------------------------------
     if (url.pathname === '/mcp') {
-      // ---- POST: JSON-RPC message ----
+      // CORS preflight
+      if (request.method === 'OPTIONS') {
+        return new Response(null, {
+          status: 204,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Accept',
+          },
+        });
+      }
+
+      // ---- GET: SSE stream — sends endpoint event so clients know where to POST
+      if (request.method === 'GET') {
+        const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+        const writer = writable.getWriter();
+        const encoder = new TextEncoder();
+
+        // Send endpoint event immediately
+        writer.write(encoder.encode(
+          sseEvent('endpoint', { uri: `${url.origin}/mcp` }),
+        )).catch(() => {});
+
+        // Periodic comment-based keepalive (CF Workers can't use setInterval
+        // reliably in long-lived streams, but this is fine for most clients)
+        const keepAlive = setInterval(() => {
+          writer.write(encoder.encode(': ping\n\n')).catch(() => {
+            clearInterval(keepAlive);
+          });
+        }, 20000);
+
+        return new Response(readable, {
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
+      }
+
+      // ---- POST: JSON-RPC message
       if (request.method === 'POST') {
         let body: JsonRpcRequest;
         try {
           body = (await request.json()) as JsonRpcRequest;
         } catch {
           return new Response(
-            JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }),
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: null,
+              error: { code: -32700, message: 'Parse error' },
+            }),
             { status: 400, headers: { 'Content-Type': 'application/json' } },
           );
         }
 
         const response = await handleJsonRpc(body, env);
 
-        // Return as JSON (for direct HTTP clients) with SSE content-type support
-        const acceptHeader = request.headers.get('Accept') ?? '';
-        if (acceptHeader.includes('text/event-stream')) {
-          const sse = sseEvent('message', response);
-          return new Response(sse, {
+        // Notification — 204 no content
+        if (response === null) {
+          return new Response(null, {
+            status: 204,
+            headers: { 'Access-Control-Allow-Origin': '*' },
+          });
+        }
+
+        const acceptsSse = (request.headers.get('Accept') ?? '').includes('text/event-stream');
+        if (acceptsSse) {
+          return new Response(sseEvent('message', response), {
             headers: {
               'Content-Type': 'text/event-stream',
               'Cache-Control': 'no-cache',
@@ -619,56 +806,13 @@ export default {
           },
         });
       }
-
-      // ---- GET: open SSE stream ----
-      if (request.method === 'GET') {
-        // For SSE-based MCP clients that open a long-lived GET stream,
-        // we send the endpoint event immediately and then accept POSTs.
-        const { readable, writable } = new TransformStream();
-        const writer = writable.getWriter();
-        const encoder = new TextEncoder();
-
-        // Send the endpoint event so the client knows where to POST
-        const origin = url.origin;
-        const endpointEvent = sseEvent('endpoint', { uri: `${origin}/mcp` });
-        await writer.write(encoder.encode(endpointEvent));
-        // Keep alive
-        const keepAlive = setInterval(async () => {
-          try {
-            await writer.write(encoder.encode(': ping\n\n'));
-          } catch {
-            clearInterval(keepAlive);
-          }
-        }, 25000);
-
-        return new Response(readable, {
-          headers: {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'Access-Control-Allow-Origin': '*',
-          },
-        });
-      }
-
-      // ---- OPTIONS: CORS preflight ----
-      if (request.method === 'OPTIONS') {
-        return new Response(null, {
-          status: 204,
-          headers: {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Accept',
-          },
-        });
-      }
     }
 
-    // ------------------------------------------------------------------
+    // -----------------------------------------------------------------------
     // /health
-    // ------------------------------------------------------------------
+    // -----------------------------------------------------------------------
     if (url.pathname === '/health') {
-      return new Response(JSON.stringify({ ok: true }), {
+      return new Response(JSON.stringify({ ok: true, version: '2.0.0' }), {
         headers: { 'Content-Type': 'application/json' },
       });
     }

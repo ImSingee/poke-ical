@@ -7,6 +7,7 @@
  * Required Worker secrets:
  *   CALDAV_USERNAME  — Apple ID email (e.g. user@icloud.com)
  *   CALDAV_PASSWORD  — App-specific password from appleid.apple.com
+ *   MCP_AUTH_TOKEN   — Shared bearer token required for all /mcp requests
  *
  * iCloud CalDAV discovery is a 2-step process:
  *   1. PROPFIND https://caldav.icloud.com/ → current-user-principal href
@@ -17,6 +18,7 @@
 export interface Env {
   CALDAV_USERNAME: string;
   CALDAV_PASSWORD: string;
+  MCP_AUTH_TOKEN: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -42,9 +44,43 @@ interface JsonRpcResponse {
 // ---------------------------------------------------------------------------
 
 const ICLOUD_CALDAV_ROOT = 'https://caldav.icloud.com';
+const MCP_CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization',
+};
 
 function basicAuth(env: Env): string {
   return 'Basic ' + btoa(`${env.CALDAV_USERNAME}:${env.CALDAV_PASSWORD}`);
+}
+
+function authorizeMcpRequest(request: Request, env: Env): Response | null {
+  const token = env.MCP_AUTH_TOKEN?.trim();
+  if (!token) {
+    console.error('[poke-ical] MCP_AUTH_TOKEN is not configured');
+    return new Response('Server misconfigured: MCP_AUTH_TOKEN is not set.', {
+      status: 500,
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        ...MCP_CORS_HEADERS,
+      },
+    });
+  }
+
+  const expected = `Bearer ${token}`;
+  const provided = request.headers.get('Authorization') ?? '';
+  if (provided !== expected) {
+    return new Response('Unauthorized', {
+      status: 401,
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'WWW-Authenticate': 'Bearer',
+        ...MCP_CORS_HEADERS,
+      },
+    });
+  }
+
+  return null;
 }
 
 /**
@@ -725,13 +761,12 @@ export default {
       if (request.method === 'OPTIONS') {
         return new Response(null, {
           status: 204,
-          headers: {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Accept',
-          },
+          headers: MCP_CORS_HEADERS,
         });
       }
+
+      const authError = authorizeMcpRequest(request, env);
+      if (authError) return authError;
 
       // ---- GET: SSE stream — sends endpoint event so clients know where to POST
       if (request.method === 'GET') {
@@ -757,7 +792,7 @@ export default {
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache',
             'Connection': 'keep-alive',
-            'Access-Control-Allow-Origin': '*',
+            ...MCP_CORS_HEADERS,
           },
         });
       }
@@ -784,7 +819,7 @@ export default {
         if (response === null) {
           return new Response(null, {
             status: 204,
-            headers: { 'Access-Control-Allow-Origin': '*' },
+            headers: MCP_CORS_HEADERS,
           });
         }
 
@@ -794,7 +829,7 @@ export default {
             headers: {
               'Content-Type': 'text/event-stream',
               'Cache-Control': 'no-cache',
-              'Access-Control-Allow-Origin': '*',
+              ...MCP_CORS_HEADERS,
             },
           });
         }
@@ -802,7 +837,7 @@ export default {
         return new Response(JSON.stringify(response), {
           headers: {
             'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
+            ...MCP_CORS_HEADERS,
           },
         });
       }

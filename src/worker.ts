@@ -139,6 +139,36 @@ function xmlFirst(xml: string, localName: string): string {
   return xmlAll(xml, localName)[0] ?? '';
 }
 
+/** Check whether an XML fragment contains a tag with the given local name. */
+function xmlHasTag(xml: string, localName: string): boolean {
+  const re = new RegExp(`<(?:[^:>]+:)?${localName}\\b`, 'i');
+  return re.test(xml);
+}
+
+function getResourceTypeFlags(xml: string): {
+  isCalendar: boolean;
+  isSubscribed: boolean;
+  isCollection: boolean;
+} {
+  const resourceTypeXml = xmlFirst(xml, 'resourcetype');
+  return {
+    isCalendar: xmlHasTag(resourceTypeXml, 'calendar'),
+    isSubscribed: xmlHasTag(resourceTypeXml, 'subscribed'),
+    isCollection: xmlHasTag(resourceTypeXml, 'collection'),
+  };
+}
+
+function getSupportedComponentFlags(xml: string): {
+  supportsVevent: boolean;
+  supportsVtodo: boolean;
+} {
+  const componentsXml = xmlFirst(xml, 'supported-calendar-component-set');
+  return {
+    supportsVevent: /<[^>]*comp\b[^>]*name=['"]VEVENT['"]/i.test(componentsXml),
+    supportsVtodo: /<[^>]*comp\b[^>]*name=['"]VTODO['"]/i.test(componentsXml),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Step 1 – resolve current-user-principal
 // ---------------------------------------------------------------------------
@@ -231,6 +261,7 @@ async function discoverCalendars(
   <D:prop>
     <D:displayname/>
     <D:resourcetype/>
+    <C:supported-calendar-component-set/>
     <CS:getctag/>
   </D:prop>
 </D:propfind>`;
@@ -245,10 +276,10 @@ async function discoverCalendars(
   const calendars: Array<{ url: string; displayName: string; ctag: string }> = [];
 
   for (const block of responseBlocks) {
-    // Must be a calendar collection (resourcetype contains 'calendar')
-    if (!/calendar/i.test(block)) continue;
-    // But skip the home-set container itself (which is only a collection, not a calendar)
-    if (/principal/i.test(block)) continue;
+    const { isCalendar } = getResourceTypeFlags(block);
+    const { supportsVevent } = getSupportedComponentFlags(block);
+    if (!isCalendar) continue;
+    if (!supportsVevent) continue;
 
     const rawHref = xmlFirst(block, 'href');
     if (!rawHref) continue;

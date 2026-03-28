@@ -1,3 +1,5 @@
+import ICAL from 'ical.js';
+
 /**
  * poke-ical: iCloud Calendar MCP Server (Cloudflare Worker)
  *
@@ -390,6 +392,133 @@ function parseEvents(xml: string): Array<Record<string, string>> {
   return events;
 }
 
+function normalizeSourceUrl(sourceUrl: string): string {
+  if (/^webcal:\/\//i.test(sourceUrl)) {
+    return `https://${sourceUrl.slice('webcal://'.length)}`;
+  }
+  return sourceUrl;
+}
+
+function parseIcalDateValue(value?: string, rawKey?: string): number | null {
+  if (!value) return null;
+
+  const isDateOnly = /(?:^|;)VALUE=DATE(?:;|$)/i.test(rawKey ?? '') || /^\d{8}$/.test(value);
+  if (isDateOnly) {
+    const year = Number(value.slice(0, 4));
+    const month = Number(value.slice(4, 6));
+    const day = Number(value.slice(6, 8));
+    return Date.UTC(year, month - 1, day);
+  }
+
+  const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})?(Z)?$/.exec(value);
+  if (!match) return null;
+
+  const [, year, month, day, hour, minute, second = '00', isUtc] = match;
+  const millis = Date.UTC(
+    Number(year),
+    Number(month) - 1,
+    Number(day),
+    Number(hour),
+    Number(minute),
+    Number(second),
+  );
+
+  // Floating times are interpreted as UTC to keep filtering deterministic.
+  return isUtc ? millis : millis;
+}
+
+function eventOverlapsRange(
+  eventStart: number,
+  eventEnd: number,
+  rangeStart?: string,
+  rangeEnd?: string,
+): boolean {
+  const startBound = parseIcalDateValue(rangeStart) ?? Number.NEGATIVE_INFINITY;
+  const endBound = parseIcalDateValue(rangeEnd) ?? Number.POSITIVE_INFINITY;
+  return eventStart < endBound && eventEnd > startBound;
+}
+
+function buildEventRecord(
+  event: InstanceType<typeof ICAL.Event>,
+  startDate = event.startDate,
+  endDate = event.endDate,
+  recurrenceId?: InstanceType<typeof ICAL.Time>,
+): Record<string, string> {
+  const record: Record<string, string> = {
+    UID: event.uid,
+    SUMMARY: event.summary ?? '',
+    DTSTART: startDate.toICALString(),
+    DTEND: endDate.toICALString(),
+  };
+
+  if (event.description) record.DESCRIPTION = event.description;
+  if (event.location) record.LOCATION = event.location;
+
+  const dtstamp = event.component.getFirstPropertyValue('dtstamp');
+  if (dtstamp instanceof ICAL.Time) record.DTSTAMP = dtstamp.toICALString();
+
+  if (recurrenceId) record['RECURRENCE-ID'] = recurrenceId.toICALString();
+
+  return record;
+}
+
+async function fetchSubscribedEvents(
+  sourceUrl: string,
+  start?: string,
+  end?: string,
+): Promise<Array<Record<string, string>>> {
+  const normalizedUrl = normalizeSourceUrl(sourceUrl);
+
+  // Intentionally omit Authorization so iCloud credentials never leak to the subscribed source.
+  const res = await fetch(normalizedUrl, {
+    method: 'GET',
+    headers: {
+      Accept: 'text/calendar, text/plain;q=0.9, */*;q=0.1',
+    },
+  });
+  const text = await res.text();
+  if (res.status >= 400) {
+    throw new Error(`GET subscribed calendar ${normalizedUrl} returned ${res.status}.`);
+  }
+
+  const root = new ICAL.Component(ICAL.parse(text));
+  const vevents = root.getAllSubcomponents('vevent');
+  const events: Array<Record<string, string>> = [];
+  const hasFiniteRangeEnd = Boolean(end);
+  const endBound = parseIcalDateValue(end) ?? Number.POSITIVE_INFINITY;
+
+  for (const vevent of vevents) {
+    const event = new ICAL.Event(vevent);
+    if (event.isRecurrenceException()) continue;
+
+    if (!event.isRecurring() || !hasFiniteRangeEnd) {
+      const eventStart = event.startDate.toJSDate().getTime();
+      const eventEnd = event.endDate.toJSDate().getTime();
+      if (eventOverlapsRange(eventStart, eventEnd, start, end)) {
+        events.push(buildEventRecord(event));
+      }
+      continue;
+    }
+
+    const iter = event.iterator();
+    let occurrence: InstanceType<typeof ICAL.Time> | null;
+    while ((occurrence = iter.next())) {
+      const details = event.getOccurrenceDetails(occurrence);
+      const occurrenceStart = details.startDate.toJSDate().getTime();
+      if (occurrenceStart >= endBound) break;
+
+      const occurrenceEnd = details.endDate.toJSDate().getTime();
+      if (!eventOverlapsRange(occurrenceStart, occurrenceEnd, start, end)) continue;
+
+      events.push(
+        buildEventRecord(event, details.startDate, details.endDate, details.recurrenceId),
+      );
+    }
+  }
+
+  return events;
+}
+
 // ---------------------------------------------------------------------------
 // Build a minimal VCALENDAR / VEVENT string for PUT requests
 // ---------------------------------------------------------------------------
@@ -456,6 +585,29 @@ const TOOLS = [
         },
       },
       required: ['calendar_url'],
+    },
+  },
+  {
+    name: 'list_subscribed_events',
+    description:
+      'List events from a subscribed calendar source URL, optionally filtered by a date range.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source_url: {
+          type: 'string',
+          description: 'Subscribed calendar source URL from list_calendars.',
+        },
+        start: {
+          type: 'string',
+          description: 'Start in iCalendar basic format, e.g. 20260101T000000Z.',
+        },
+        end: {
+          type: 'string',
+          description: 'End in iCalendar basic format, e.g. 20261231T235959Z.',
+        },
+      },
+      required: ['source_url'],
     },
   },
   {
@@ -583,6 +735,16 @@ async function executeTool(
       const events = await fetchEvents(
         env,
         args.calendar_url as string,
+        args.start as string | undefined,
+        args.end as string | undefined,
+      );
+      return { events };
+    }
+
+    // ---- list_subscribed_events -------------------------------------------
+    case 'list_subscribed_events': {
+      const events = await fetchSubscribedEvents(
+        args.source_url as string,
         args.start as string | undefined,
         args.end as string | undefined,
       );

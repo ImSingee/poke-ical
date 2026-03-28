@@ -252,7 +252,13 @@ async function resolveHomeSet(env: Env): Promise<string> {
 // ---------------------------------------------------------------------------
 async function discoverCalendars(
   env: Env,
-): Promise<Array<{ url: string; displayName: string; ctag: string }>> {
+): Promise<Array<{
+  url: string;
+  displayName: string;
+  ctag: string;
+  kind: 'calendar' | 'subscribed';
+  source_url?: string;
+}>> {
   const homeSetUrl = await resolveHomeSet(env);
 
   const body = `<?xml version="1.0" encoding="utf-8"?>
@@ -262,6 +268,7 @@ async function discoverCalendars(
     <D:displayname/>
     <D:resourcetype/>
     <C:supported-calendar-component-set/>
+    <CS:source/>
     <CS:getctag/>
   </D:prop>
 </D:propfind>`;
@@ -273,12 +280,18 @@ async function discoverCalendars(
 
   // Split into per-response blocks
   const responseBlocks = text.split(/<(?:[^:>]+:)?response(?:\s[^>]*)?>/).slice(1);
-  const calendars: Array<{ url: string; displayName: string; ctag: string }> = [];
+  const calendars: Array<{
+    url: string;
+    displayName: string;
+    ctag: string;
+    kind: 'calendar' | 'subscribed';
+    source_url?: string;
+  }> = [];
 
   for (const block of responseBlocks) {
-    const { isCalendar } = getResourceTypeFlags(block);
+    const { isCalendar, isSubscribed } = getResourceTypeFlags(block);
     const { supportsVevent } = getSupportedComponentFlags(block);
-    if (!isCalendar) continue;
+    if (!isCalendar && !isSubscribed) continue;
     if (!supportsVevent) continue;
 
     const rawHref = xmlFirst(block, 'href');
@@ -290,8 +303,15 @@ async function discoverCalendars(
 
     const displayName = xmlFirst(block, 'displayname') || rawHref;
     const ctag = xmlFirst(block, 'getctag');
+    const sourceUrl = xmlFirst(xmlFirst(block, 'source'), 'href') || undefined;
 
-    calendars.push({ url, displayName, ctag });
+    calendars.push({
+      url,
+      displayName,
+      ctag,
+      kind: isSubscribed ? 'subscribed' : 'calendar',
+      source_url: sourceUrl,
+    });
   }
 
   console.log(`[poke-ical] discovered ${calendars.length} calendar(s):`,

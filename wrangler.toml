@@ -6,3 +6,9 @@ compatibility_date = "2025-01-01"
 #   CALDAV_USERNAME  — Apple ID email
 #   CALDAV_PASSWORD  — App-specific password from appleid.apple.com
 #   MCP_AUTH_TOKEN   — Shared bearer token required on /mcp
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true

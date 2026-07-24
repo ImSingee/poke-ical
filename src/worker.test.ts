@@ -176,6 +176,21 @@ describe('calendar_url validation', () => {
   });
 });
 
+describe('tool logging', () => {
+  it('includes the tool name in the log message', async () => {
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    await callTool('list_events', {});
+
+    expect(consoleLog).toHaveBeenCalledWith({
+      message: '[poke-ical] MCP tool call: list_events',
+      jsonRpcId: 1,
+      tool: 'list_events',
+      arguments: {},
+    });
+  });
+});
+
 describe('tool metadata', () => {
   it('tells agents how to obtain calendar_url', async () => {
     const response = await postJsonRpc({

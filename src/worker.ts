@@ -984,7 +984,7 @@ async function handleJsonRpc(
       ) as { name?: unknown; arguments?: unknown };
 
       console.log({
-        message: '[poke-ical] MCP tool call',
+        message: `[poke-ical] MCP tool call: ${String(logParams.name ?? 'unknown')}`,
         jsonRpcId: id,
         tool: logParams.name,
         arguments: logParams.arguments === undefined ? {} : logParams.arguments,

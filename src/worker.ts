@@ -979,6 +979,17 @@ async function handleJsonRpc(
     }
 
     if (method === 'tools/call') {
+      const logParams = (
+        params !== null && typeof params === 'object' ? params : {}
+      ) as { name?: unknown; arguments?: unknown };
+
+      console.log({
+        message: '[poke-ical] MCP tool call',
+        jsonRpcId: id,
+        tool: logParams.name,
+        arguments: logParams.arguments === undefined ? {} : logParams.arguments,
+      });
+
       const p = params as { name: string; arguments?: Record<string, unknown> };
       let toolResult: unknown;
       try {

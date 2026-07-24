@@ -2,7 +2,7 @@
 
 An iCloud CalDAV MCP bridge for Poke, deployed as a Cloudflare Worker.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/mollyvita/poke-ical)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/ImSingee/poke-ical)
 
 ## Deployment guide
 
@@ -15,30 +15,13 @@ npm install
 npx wrangler deploy
 ```
 
-### 2. Set up secrets
-
-After deploying, add your iCloud credentials and MCP bearer token as Worker secrets. You can do this in two ways:
-
-**Via the Cloudflare dashboard:**
-1. Open your Worker in the [Cloudflare dashboard](https://dash.cloudflare.com).
-2. Go to **Settings** → **Variables** → **Secret variables**.
-3. Add the following secrets:
-
-| Secret | Value |
-|---|---|
-| `CALDAV_USERNAME` | Your Apple ID email (e.g. `you@icloud.com`) |
-| `CALDAV_PASSWORD` | An app-specific password from [appleid.apple.com](https://appleid.apple.com) |
-| `MCP_AUTH_TOKEN` | A long random shared secret used as `Authorization: Bearer <token>` |
-
-**Via Wrangler CLI:**
+### 2. Create an App Token
 
 ```bash
-npx wrangler secret put CALDAV_USERNAME
-npx wrangler secret put CALDAV_PASSWORD
-npx wrangler secret put MCP_AUTH_TOKEN
+printf '%s' '<Apple Account>:<App-Specific Password>' | base64
 ```
 
-> To generate an app-specific password, sign in at [appleid.apple.com](https://appleid.apple.com), go to **Sign-In and Security** → **App-Specific Passwords**, and generate a new password for this Worker.
+The Base64 output is your App Token. To generate an app-specific password, sign in at [appleid.apple.com](https://appleid.apple.com), then go to **Sign-In and Security** → **App-Specific Passwords**.
 
 ### 3. Connect to Poke
 
@@ -48,10 +31,10 @@ Once deployed, add your Worker URL as an MCP integration in Poke:
 https://<your-worker>.workers.dev/mcp
 ```
 
-Your MCP client must send this header on both the SSE `GET /mcp` request and the JSON-RPC `POST /mcp` request:
+Set the App Token as the API Key in Poke. Poke sends it on both the SSE `GET /mcp` request and the JSON-RPC `POST /mcp` request as:
 
 ```http
-Authorization: Bearer <MCP_AUTH_TOKEN>
+Authorization: Bearer <App Token>
 ```
 
 ---
@@ -67,7 +50,7 @@ All MCP communication happens at:
 Accepts both `GET` (SSE stream) and `POST` (JSON-RPC 2.0) requests, and requires:
 
 ```http
-Authorization: Bearer <MCP_AUTH_TOKEN>
+Authorization: Bearer <App Token>
 ```
 
 ## Available tools

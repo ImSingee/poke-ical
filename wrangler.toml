@@ -3,11 +3,6 @@ main = "src/worker.ts"
 compatibility_date = "2026-02-24"
 compatibility_flags = ["global_fetch_strictly_public"]
 
-# Required secrets (set via `npx wrangler secret put`):
-#   CALDAV_USERNAME  — Apple ID email
-#   CALDAV_PASSWORD  — App-specific password from appleid.apple.com
-#   MCP_AUTH_TOKEN   — Shared bearer token required on /mcp
-
 [observability.logs]
 enabled = true
 head_sampling_rate = 1

@@ -6,10 +6,8 @@ import ICAL from 'ical.js';
  * Exposes 9 CalDAV tools via the Model Context Protocol over SSE.
  * Endpoint: /mcp
  *
- * Required Worker secrets:
- *   CALDAV_USERNAME  — Apple ID email (e.g. user@icloud.com)
- *   CALDAV_PASSWORD  — App-specific password from appleid.apple.com
- *   MCP_AUTH_TOKEN   — Shared bearer token required for all /mcp requests
+ * App Token:
+ *   Base64(<Apple Account>:<App-Specific Password>)
  *
  * iCloud CalDAV discovery is a 2-step process:
  *   1. PROPFIND https://caldav.icloud.com/ → current-user-principal href
@@ -17,10 +15,8 @@ import ICAL from 'ical.js';
  *   3. PROPFIND {home-set} → enumerate individual calendars
  */
 
-export interface Env {
-  CALDAV_USERNAME: string;
-  CALDAV_PASSWORD: string;
-  MCP_AUTH_TOKEN: string;
+interface AppleCredentials {
+  basicToken: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -52,37 +48,38 @@ const MCP_CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization',
 };
 
-function basicAuth(env: Env): string {
-  return 'Basic ' + btoa(`${env.CALDAV_USERNAME}:${env.CALDAV_PASSWORD}`);
+function basicAuth(credentials: AppleCredentials): string {
+  return `Basic ${credentials.basicToken}`;
 }
 
-function authorizeMcpRequest(request: Request, env: Env): Response | null {
-  const token = env.MCP_AUTH_TOKEN?.trim();
-  if (!token) {
-    console.error('[poke-ical] MCP_AUTH_TOKEN is not configured');
-    return new Response('Server misconfigured: MCP_AUTH_TOKEN is not set.', {
-      status: 500,
-      headers: {
-        'Content-Type': 'text/plain; charset=utf-8',
-        ...MCP_CORS_HEADERS,
-      },
-    });
+function parseAppleCredentials(request: Request): AppleCredentials | null {
+  const authorization = request.headers.get('Authorization') ?? '';
+  const match = /^Bearer ([A-Za-z0-9+/]+={0,2})$/i.exec(authorization);
+  if (!match) return null;
+
+  const basicToken = match[1];
+  try {
+    const decoded = atob(basicToken);
+    const separator = decoded.indexOf(':');
+    if (separator <= 0 || separator === decoded.length - 1 || btoa(decoded) !== basicToken) {
+      return null;
+    }
+  } catch {
+    return null;
   }
 
-  const expected = `Bearer ${token}`;
-  const provided = request.headers.get('Authorization') ?? '';
-  if (provided !== expected) {
-    return new Response('Unauthorized', {
-      status: 401,
-      headers: {
-        'Content-Type': 'text/plain; charset=utf-8',
-        'WWW-Authenticate': 'Bearer',
-        ...MCP_CORS_HEADERS,
-      },
-    });
-  }
+  return { basicToken };
+}
 
-  return null;
+function unauthorizedResponse(): Response {
+  return new Response('Unauthorized', {
+    status: 401,
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'WWW-Authenticate': 'Bearer',
+      ...MCP_CORS_HEADERS,
+    },
+  });
 }
 
 /**
@@ -91,14 +88,14 @@ function authorizeMcpRequest(request: Request, env: Env): Response | null {
  * HTTP-level errors so callers can decide how to handle them.
  */
 async function caldavRequest(
-  env: Env,
+  credentials: AppleCredentials,
   url: string,
   method: string,
   body?: string,
   extraHeaders?: Record<string, string>,
 ): Promise<{ status: number; text: string }> {
   const headers: Record<string, string> = {
-    Authorization: basicAuth(env),
+    Authorization: basicAuth(credentials),
     'Content-Type': 'application/xml; charset=utf-8',
     ...extraHeaders,
   };
@@ -174,7 +171,7 @@ function getSupportedComponentFlags(xml: string): {
 // ---------------------------------------------------------------------------
 // Step 1 – resolve current-user-principal
 // ---------------------------------------------------------------------------
-async function fetchPrincipalUrl(env: Env): Promise<string> {
+async function fetchPrincipalUrl(credentials: AppleCredentials): Promise<string> {
   const body = `<?xml version="1.0" encoding="utf-8"?>
 <D:propfind xmlns:D="DAV:">
   <D:prop>
@@ -183,7 +180,7 @@ async function fetchPrincipalUrl(env: Env): Promise<string> {
 </D:propfind>`;
 
   const { status, text } = await caldavRequest(
-    env,
+    credentials,
     `${ICLOUD_CALDAV_ROOT}/`,
     'PROPFIND',
     body,
@@ -193,7 +190,7 @@ async function fetchPrincipalUrl(env: Env): Promise<string> {
   if (status >= 400) {
     throw new Error(
       `PROPFIND for current-user-principal returned ${status}. ` +
-      'Check CALDAV_USERNAME and CALDAV_PASSWORD.',
+      'Check the Apple Account and App-Specific Password in the App Token.',
     );
   }
 
@@ -211,7 +208,10 @@ async function fetchPrincipalUrl(env: Env): Promise<string> {
 // ---------------------------------------------------------------------------
 // Step 2 – resolve calendar-home-set from principal URL
 // ---------------------------------------------------------------------------
-async function fetchCalendarHomeSet(env: Env, principalUrl: string): Promise<string> {
+async function fetchCalendarHomeSet(
+  credentials: AppleCredentials,
+  principalUrl: string,
+): Promise<string> {
   const body = `<?xml version="1.0" encoding="utf-8"?>
 <D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <D:prop>
@@ -220,7 +220,7 @@ async function fetchCalendarHomeSet(env: Env, principalUrl: string): Promise<str
 </D:propfind>`;
 
   const { status, text } = await caldavRequest(
-    env,
+    credentials,
     principalUrl,
     'PROPFIND',
     body,
@@ -244,16 +244,16 @@ async function fetchCalendarHomeSet(env: Env, principalUrl: string): Promise<str
 // ---------------------------------------------------------------------------
 // Full 2-step iCloud discovery → calendar-home-set URL
 // ---------------------------------------------------------------------------
-async function resolveHomeSet(env: Env): Promise<string> {
-  const principalUrl = await fetchPrincipalUrl(env);
-  return fetchCalendarHomeSet(env, principalUrl);
+async function resolveHomeSet(credentials: AppleCredentials): Promise<string> {
+  const principalUrl = await fetchPrincipalUrl(credentials);
+  return fetchCalendarHomeSet(credentials, principalUrl);
 }
 
 // ---------------------------------------------------------------------------
 // Step 3 – list calendars under the home-set URL
 // ---------------------------------------------------------------------------
 async function discoverCalendars(
-  env: Env,
+  credentials: AppleCredentials,
 ): Promise<Array<{
   url: string;
   displayName: string;
@@ -261,7 +261,7 @@ async function discoverCalendars(
   kind: 'calendar' | 'subscribed';
   source_url?: string;
 }>> {
-  const homeSetUrl = await resolveHomeSet(env);
+  const homeSetUrl = await resolveHomeSet(credentials);
 
   const body = `<?xml version="1.0" encoding="utf-8"?>
 <D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"
@@ -275,7 +275,9 @@ async function discoverCalendars(
   </D:prop>
 </D:propfind>`;
 
-  const { status, text } = await caldavRequest(env, homeSetUrl, 'PROPFIND', body, { Depth: '1' });
+  const { status, text } = await caldavRequest(credentials, homeSetUrl, 'PROPFIND', body, {
+    Depth: '1',
+  });
   if (status >= 400) {
     throw new Error(`PROPFIND for calendars at ${homeSetUrl} returned ${status}.`);
   }
@@ -325,7 +327,7 @@ async function discoverCalendars(
 // Fetch events via calendar-query REPORT
 // ---------------------------------------------------------------------------
 async function fetchEvents(
-  env: Env,
+  credentials: AppleCredentials,
   calendarUrl: string,
   start?: string,
   end?: string,
@@ -351,7 +353,7 @@ async function fetchEvents(
   </C:filter>
 </C:calendar-query>`;
 
-  const { status, text } = await caldavRequest(env, calendarUrl, 'REPORT', body, {
+  const { status, text } = await caldavRequest(credentials, calendarUrl, 'REPORT', body, {
     Depth: '1',
   });
   if (status >= 400) {
@@ -721,19 +723,19 @@ const TOOLS = [
 async function executeTool(
   name: string,
   args: Record<string, unknown>,
-  env: Env,
+  credentials: AppleCredentials,
 ): Promise<unknown> {
   switch (name) {
     // ---- list_calendars ---------------------------------------------------
     case 'list_calendars': {
-      const calendars = await discoverCalendars(env);
+      const calendars = await discoverCalendars(credentials);
       return { calendars };
     }
 
     // ---- list_events ------------------------------------------------------
     case 'list_events': {
       const events = await fetchEvents(
-        env,
+        credentials,
         args.calendar_url as string,
         args.start as string | undefined,
         args.end as string | undefined,
@@ -753,7 +755,7 @@ async function executeTool(
 
     // ---- get_event --------------------------------------------------------
     case 'get_event': {
-      const { status, text } = await caldavRequest(env, args.event_url as string, 'GET');
+      const { status, text } = await caldavRequest(credentials, args.event_url as string, 'GET');
       if (status >= 400) throw new Error(`GET event returned ${status}`);
       return { ical: text };
     }
@@ -772,7 +774,7 @@ async function executeTool(
         allDay: args.all_day as boolean | undefined,
       });
       const eventUrl = `${calUrl}${uid}.ics`;
-      const { status } = await caldavRequest(env, eventUrl, 'PUT', ical, {
+      const { status } = await caldavRequest(credentials, eventUrl, 'PUT', ical, {
         'Content-Type': 'text/calendar; charset=utf-8',
         'If-None-Match': '*',
       });
@@ -783,7 +785,7 @@ async function executeTool(
     // ---- update_event -----------------------------------------------------
     case 'update_event': {
       const eventUrl = args.event_url as string;
-      const { status: gs, text: existing } = await caldavRequest(env, eventUrl, 'GET');
+      const { status: gs, text: existing } = await caldavRequest(credentials, eventUrl, 'GET');
       if (gs >= 400) throw new Error(`GET event for update returned ${gs}`);
 
       let updated = existing;
@@ -817,7 +819,7 @@ async function executeTool(
       };
       if (args.etag) putHeaders['If-Match'] = args.etag as string;
 
-      const { status } = await caldavRequest(env, eventUrl, 'PUT', updated, putHeaders);
+      const { status } = await caldavRequest(credentials, eventUrl, 'PUT', updated, putHeaders);
       if (status >= 400) throw new Error(`PUT update returned ${status}`);
       return { event_url: eventUrl, status };
     }
@@ -827,7 +829,13 @@ async function executeTool(
       const eventUrl = args.event_url as string;
       const headers: Record<string, string> = {};
       if (args.etag) headers['If-Match'] = args.etag as string;
-      const { status } = await caldavRequest(env, eventUrl, 'DELETE', undefined, headers);
+      const { status } = await caldavRequest(
+        credentials,
+        eventUrl,
+        'DELETE',
+        undefined,
+        headers,
+      );
       if (status >= 400 && status !== 404)
         throw new Error(`DELETE returned ${status}`);
       return { deleted: true, status };
@@ -837,7 +845,7 @@ async function executeTool(
     case 'search_events': {
       const q = (args.query as string).toLowerCase();
       const events = await fetchEvents(
-        env,
+        credentials,
         args.calendar_url as string,
         args.start as string | undefined,
         args.end as string | undefined,
@@ -854,7 +862,7 @@ async function executeTool(
     // ---- get_freebusy -----------------------------------------------------
     case 'get_freebusy': {
       const events = await fetchEvents(
-        env,
+        credentials,
         args.calendar_url as string,
         args.start as string,
         args.end as string,
@@ -869,7 +877,7 @@ async function executeTool(
 
     // ---- get_ical_feed ----------------------------------------------------
     case 'get_ical_feed': {
-      const events = await fetchEvents(env, args.calendar_url as string);
+      const events = await fetchEvents(credentials, args.calendar_url as string);
       const lines = [
         'BEGIN:VCALENDAR',
         'VERSION:2.0',
@@ -897,7 +905,10 @@ async function executeTool(
 // JSON-RPC dispatcher
 // ---------------------------------------------------------------------------
 
-async function handleJsonRpc(req: JsonRpcRequest, env: Env): Promise<JsonRpcResponse | null> {
+async function handleJsonRpc(
+  req: JsonRpcRequest,
+  credentials: AppleCredentials,
+): Promise<JsonRpcResponse | null> {
   const { method, params, id } = req;
 
   try {
@@ -924,7 +935,7 @@ async function handleJsonRpc(req: JsonRpcRequest, env: Env): Promise<JsonRpcResp
 
     if (method === 'tools/call') {
       const p = params as { name: string; arguments?: Record<string, unknown> };
-      const toolResult = await executeTool(p.name, p.arguments ?? {}, env);
+      const toolResult = await executeTool(p.name, p.arguments ?? {}, credentials);
       return {
         jsonrpc: '2.0',
         id,
@@ -963,7 +974,7 @@ function sseEvent(eventType: string, data: unknown): string {
 // ---------------------------------------------------------------------------
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
     // -----------------------------------------------------------------------
@@ -978,8 +989,8 @@ export default {
         });
       }
 
-      const authError = authorizeMcpRequest(request, env);
-      if (authError) return authError;
+      const credentials = parseAppleCredentials(request);
+      if (!credentials) return unauthorizedResponse();
 
       // ---- GET: SSE stream — sends endpoint event so clients know where to POST
       if (request.method === 'GET') {
@@ -1026,7 +1037,7 @@ export default {
           );
         }
 
-        const response = await handleJsonRpc(body, env);
+        const response = await handleJsonRpc(body, credentials);
 
         // Notification — 204 no content
         if (response === null) {

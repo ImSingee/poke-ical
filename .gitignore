@@ -1,3 +1,4 @@
-.dev.vars
+.dev.vars*
+.env*
 node_modules
 .wrangler

@@ -37,6 +37,13 @@ interface JsonRpcResponse {
   error?: { code: number; message: string; data?: unknown };
 }
 
+class ToolInputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ToolInputError';
+  }
+}
+
 // ---------------------------------------------------------------------------
 // CalDAV constants & low-level helpers
 // ---------------------------------------------------------------------------
@@ -559,6 +566,17 @@ function makeVEvent(params: {
 // MCP tool definitions
 // ---------------------------------------------------------------------------
 
+const CALENDAR_URL_INPUT_SCHEMA = {
+  type: 'string',
+  format: 'uri',
+  pattern: '^https://',
+  minLength: 1,
+  description:
+    'Required. Call list_calendars first and pass the selected calendar\'s "url" field. ' +
+    'Do not pass its displayName or source_url. Subscribed calendars are read-only; use ' +
+    'list_subscribed_events with source_url to read them.',
+};
+
 const TOOLS = [
   {
     name: 'list_calendars',
@@ -574,8 +592,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         calendar_url: {
-          type: 'string',
-          description: 'CalDAV URL of the calendar (from list_calendars).',
+          ...CALENDAR_URL_INPUT_SCHEMA,
         },
         start: {
           type: 'string',
@@ -632,7 +649,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        calendar_url: { type: 'string', description: 'CalDAV URL of the target calendar.' },
+        calendar_url: { ...CALENDAR_URL_INPUT_SCHEMA },
         summary: { type: 'string', description: 'Event title.' },
         dtstart: { type: 'string', description: 'Start, e.g. 20260315T140000Z.' },
         dtend: { type: 'string', description: 'End, e.g. 20260315T150000Z.' },
@@ -682,7 +699,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        calendar_url: { type: 'string', description: 'CalDAV URL of the calendar to search.' },
+        calendar_url: { ...CALENDAR_URL_INPUT_SCHEMA },
         query: { type: 'string', description: 'Keyword to match.' },
         start: { type: 'string', description: 'Optional start bound (iCal format).' },
         end: { type: 'string', description: 'Optional end bound (iCal format).' },
@@ -696,7 +713,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        calendar_url: { type: 'string', description: 'CalDAV URL of the calendar.' },
+        calendar_url: { ...CALENDAR_URL_INPUT_SCHEMA },
         start: { type: 'string', description: 'Range start in iCal format.' },
         end: { type: 'string', description: 'Range end in iCal format.' },
       },
@@ -709,7 +726,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        calendar_url: { type: 'string', description: 'CalDAV URL of the calendar.' },
+        calendar_url: { ...CALENDAR_URL_INPUT_SCHEMA },
       },
       required: ['calendar_url'],
     },
@@ -719,6 +736,30 @@ const TOOLS = [
 // ---------------------------------------------------------------------------
 // Tool execution
 // ---------------------------------------------------------------------------
+
+function requireCalendarUrl(toolName: string, args: Record<string, unknown>): string {
+  const calendarUrl = args.calendar_url;
+  const message =
+    `Invalid arguments for ${toolName}: "calendar_url" is required and must be an ` +
+    `absolute HTTPS URL. Call list_calendars first, choose the desired calendar, then retry ` +
+    `${toolName} using that calendar's "url" value as "calendar_url". Subscribed calendars ` +
+    `are read-only; to read one, use list_subscribed_events with "source_url".`;
+
+  if (typeof calendarUrl !== 'string' || calendarUrl.trim() === '') {
+    throw new ToolInputError(message);
+  }
+
+  const normalizedUrl = calendarUrl.trim();
+  try {
+    const parsedUrl = new URL(normalizedUrl);
+    if (parsedUrl.protocol !== 'https:') throw new ToolInputError(message);
+  } catch (err) {
+    if (err instanceof ToolInputError) throw err;
+    throw new ToolInputError(message);
+  }
+
+  return normalizedUrl;
+}
 
 async function executeTool(
   name: string,
@@ -734,9 +775,10 @@ async function executeTool(
 
     // ---- list_events ------------------------------------------------------
     case 'list_events': {
+      const calendarUrl = requireCalendarUrl(name, args);
       const events = await fetchEvents(
         credentials,
-        args.calendar_url as string,
+        calendarUrl,
         args.start as string | undefined,
         args.end as string | undefined,
       );
@@ -762,7 +804,7 @@ async function executeTool(
 
     // ---- create_event -----------------------------------------------------
     case 'create_event': {
-      const calUrl = (args.calendar_url as string).replace(/\/?$/, '/');
+      const calUrl = requireCalendarUrl(name, args).replace(/\/?$/, '/');
       const uid = crypto.randomUUID();
       const ical = makeVEvent({
         uid,
@@ -843,10 +885,11 @@ async function executeTool(
 
     // ---- search_events ----------------------------------------------------
     case 'search_events': {
+      const calendarUrl = requireCalendarUrl(name, args);
       const q = (args.query as string).toLowerCase();
       const events = await fetchEvents(
         credentials,
-        args.calendar_url as string,
+        calendarUrl,
         args.start as string | undefined,
         args.end as string | undefined,
       );
@@ -861,9 +904,10 @@ async function executeTool(
 
     // ---- get_freebusy -----------------------------------------------------
     case 'get_freebusy': {
+      const calendarUrl = requireCalendarUrl(name, args);
       const events = await fetchEvents(
         credentials,
-        args.calendar_url as string,
+        calendarUrl,
         args.start as string,
         args.end as string,
       );
@@ -877,7 +921,8 @@ async function executeTool(
 
     // ---- get_ical_feed ----------------------------------------------------
     case 'get_ical_feed': {
-      const events = await fetchEvents(credentials, args.calendar_url as string);
+      const calendarUrl = requireCalendarUrl(name, args);
+      const events = await fetchEvents(credentials, calendarUrl);
       const lines = [
         'BEGIN:VCALENDAR',
         'VERSION:2.0',
@@ -935,7 +980,22 @@ async function handleJsonRpc(
 
     if (method === 'tools/call') {
       const p = params as { name: string; arguments?: Record<string, unknown> };
-      const toolResult = await executeTool(p.name, p.arguments ?? {}, credentials);
+      let toolResult: unknown;
+      try {
+        toolResult = await executeTool(p.name, p.arguments ?? {}, credentials);
+      } catch (err) {
+        if (err instanceof ToolInputError) {
+          return {
+            jsonrpc: '2.0',
+            id,
+            result: {
+              content: [{ type: 'text', text: err.message }],
+              isError: true,
+            },
+          };
+        }
+        throw err;
+      }
       return {
         jsonrpc: '2.0',
         id,
